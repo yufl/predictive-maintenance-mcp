@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "maintenance_agent": "./src/bridge_executor.py:app"
+  },
+  "env": ".env"
+}
