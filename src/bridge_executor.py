@@ -10,6 +10,7 @@ from langgraph.prebuilt import ToolNode
 # 关键组件
 from langchain_core.messages import SystemMessage, BaseMessage, HumanMessage, trim_messages, ToolMessage, AIMessage
 from langchain_core.tools import Tool
+from pydantic import BaseModel
 
 from src.copilot_llm import copilot_init_llm
 
@@ -25,7 +26,12 @@ except ImportError:
 # --- 第一步：工具桥接逻辑 ---
 def safe_tool_wrapper(func):
     def wrapper(*args, **kwargs):
-        result = func(*args, **kwargs)
+        # 核心修复：如果 func 不需要参数但接收到了参数，则忽略位置参数
+        try:
+            result = func(*args, **kwargs)
+        except TypeError:
+            # 针对不带参数的函数进行降级调用
+            result = func()
         str_result = str(result)
         # 【修改点 3】将截断阈值降至 1500 字符，确保多设备并行时不会爆表
         if len(str_result) > 1500:
@@ -33,39 +39,53 @@ def safe_tool_wrapper(func):
         return result
     return wrapper
 
+def wrap_and_trim_messages(left: list, right: list):
+    """
+    替换默认的 add_messages。
+    确保整个 state 里的消息总数不会无限制增长，从源头控制 State 大小。
+    """
+    combined = left + right
+    # 强制只保留最近的 15 条消息（对于分析 3 个设备足够了）
+    if len(combined) > 15:
+        return combined[-15:]
+    return combined
+
+class NoParams(BaseModel):
+    """用于无参数工具的空模式"""
+    pass
+
 def get_langchain_tools_from_fastmcp(fastmcp_instance):
     """
     将 FastMCP 内部注册的工具自动化转换为 LangChain 工具。
     这样可以保留你在 register_all(mcp) 中定义的所有 ISO 算法逻辑。
     """
     lc_tools = []
-    # 检查 FastMCP 内部结构
-    # 尝试获取所有已注册的工具对象
     mcp_tools = fastmcp_instance._tool_manager.list_tools()
 
     for item in mcp_tools:
-        # 兼容性处理：根据返回值类型进行解包
+        # 解包逻辑保持不变
         if isinstance(item, tuple):
-            # 如果是旧版的 (name, tool_obj)
-            name = item[0]
-            tool_obj = item[1]
+            name, tool_obj = item
         else:
-            # 如果是新版直接返回 ToolDefinition 对象
             tool_obj = item
             name = tool_obj.name
 
-        # 封装为 LangChain Tool
         lc_tools.append(Tool(
             name=name,
-            # FastMCP 工具的核心执行函数通常在 .fn 属性中
             func=safe_tool_wrapper(tool_obj.fn),
-            description=tool_obj.description or tool_obj.fn.__doc__
+            description=tool_obj.description or tool_obj.fn.__doc__,
+            # 如果函数没有参数，通过指定 args_schema 告知 LangChain
+            args_schema=NoParams if tool_obj.fn.__code__.co_argcount == 0 else None
         ))
     return lc_tools
 
-# 确保 trimmer 使用正确的计数器
-trimmer = trim_messages(
-    max_tokens=3500, # 针对 8000 限制，这里设为 3500 最安全
+
+# 2. 这里的 max_tokens 必须下调到 2500-3000
+# 考虑到 GitHub Models 的 8000 限制包含：Header + System + History + Tool Definitions + Buffer
+# 这里的 max_tokens 必须降到极致
+# 8000 限制下，建议只给历史留 2500 tokens
+local_trimmer = trim_messages(
+    max_tokens=2500,
     strategy="last",
     token_counter=copilot_init_llm,
     include_system=True,
@@ -76,7 +96,7 @@ trimmer = trim_messages(
 
 class MaintenanceState(TypedDict):
     # 自动合并历史消息
-    messages: Annotated[List[BaseMessage], add_messages]
+    messages: Annotated[List[BaseMessage], wrap_and_trim_messages]
 
 
 # 1. 节点：LLM 决策节点
@@ -98,13 +118,13 @@ def call_diagnostic_model_bk(state: MaintenanceState):
 
 
 def call_diagnostic_model(state: MaintenanceState):
-    # 1. 消息清洗：防止工具返回的巨大数据撑爆 Body
+    # 1. 极其激进的清洗：将工具返回内容缩减到 800 字符以内
     processed_messages = []
     for msg in state["messages"]:
-        if isinstance(msg, ToolMessage) and len(str(msg.content)) > 2000:
-            # 强制对过长的工具返回内容进行物理截断
+        if isinstance(msg, ToolMessage) and len(str(msg.content)) > 1000:
             content_str = str(msg.content)
-            truncated_content = content_str[:1000] + "... [数据过长已截断，请基于特征值推理]"
+            # 工业诊断只需要关键特征，不需要原始数组
+            truncated_content = content_str[:800] + "...[Data Cut]"
             processed_messages.append(ToolMessage(
                 content=truncated_content,
                 tool_call_id=msg.tool_call_id
@@ -112,25 +132,14 @@ def call_diagnostic_model(state: MaintenanceState):
         else:
             processed_messages.append(msg)
 
-    # 【修改点 1】极致缩减 System Prompt。不要在这里放 ISO 全文！
-    # 将复杂的 ISO 逻辑写在工具的 docstring 里，让模型通过工具调用来感知。
-    core_rules = SystemMessage(
-        content="Expert: ISO 13374. Action: Check RMS/Peaks. Rule: Truncated data? Use stats. Output: Concise summary."
-    )
+    # 彻底放弃 mcp.instructions，改用极简指令
+    core_rules = SystemMessage(content="Act as a vibration analyst. Be concise. Use only stats.")
 
-    # 【修改点 2】将 trimmer 的 max_tokens 进一步下调
-    # 8000 总额 = System(500) + History(4000) + Output Buffer(3500)
-    # 建议将 trimmer 的 max_tokens 设为 3500-4000 之间
-    selected_history = trimmer.invoke(processed_messages)
+    selected_history = local_trimmer.invoke(processed_messages)
+    llm = copilot_init_llm.bind_tools(tools[:5])
 
-    # 3. 实例化并绑定工具
-    # 注意：tools 已经在外部定义好了
-    llm = copilot_init_llm.bind_tools(tools)
-
-    # 发送：System + 被修剪的历史
-    response = llm.invoke([core_rules] + selected_history)
-
-    return {"messages": [response]}
+    # 只有这里的调用才会产生 413，确保 [core_rules] + selected_history 足够小
+    return {"messages": [llm.invoke([core_rules] + selected_history)]}
 
 
 # 2. 节点：工具执行节点 (由 LangGraph 预置)
