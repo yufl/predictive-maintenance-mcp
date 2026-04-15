@@ -2,18 +2,16 @@ import os
 import asyncio
 from typing import Annotated, TypedDict, List, Union
 
-from dotenv import load_dotenv
-from langchain.chat_models import init_chat_model
 # 基础框架
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 # 关键组件
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, BaseMessage, HumanMessage, filter_messages, trim_messages
+from langchain_core.messages import SystemMessage, BaseMessage, HumanMessage, trim_messages, ToolMessage, AIMessage
 from langchain_core.tools import Tool
 
+from src.copilot_llm import copilot_init_llm
 
 # 导入你原有的 MCP 实例 (确保路径正确)
 # 假设你的入口文件叫 server.py，且位于当前目录下
@@ -25,6 +23,15 @@ except ImportError:
 
 
 # --- 第一步：工具桥接逻辑 ---
+def safe_tool_wrapper(func):
+    def wrapper(*args, **kwargs):
+        result = func(*args, **kwargs)
+        str_result = str(result)
+        # 【修改点 3】将截断阈值降至 1500 字符，确保多设备并行时不会爆表
+        if len(str_result) > 1500:
+            return str_result[:1500] + "\n[Data Truncated for Token Limit]"
+        return result
+    return wrapper
 
 def get_langchain_tools_from_fastmcp(fastmcp_instance):
     """
@@ -51,31 +58,18 @@ def get_langchain_tools_from_fastmcp(fastmcp_instance):
         lc_tools.append(Tool(
             name=name,
             # FastMCP 工具的核心执行函数通常在 .fn 属性中
-            func=tool_obj.fn,
+            func=safe_tool_wrapper(tool_obj.fn),
             description=tool_obj.description or tool_obj.fn.__doc__
         ))
     return lc_tools
 
-load_dotenv()
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-llm_model = init_chat_model(
-    model="gpt-4o",
-    model_provider="openai",
-    api_key=GITHUB_TOKEN,
-    base_url="https://models.inference.ai.azure.com",
-    temperature=0,  # 诊断任务建议设为 0 以保证严谨性
-)
-
-# 定义修剪器
-# strategy="last": 保留最后的对话
-# token_counter: 使用模型对应的计数器
-# max_tokens: 预留空间给 System Message 和工具输出
+# 确保 trimmer 使用正确的计数器
 trimmer = trim_messages(
-    max_tokens=4000,
+    max_tokens=3500, # 针对 8000 限制，这里设为 3500 最安全
     strategy="last",
-    token_counter=llm_model,
-    include_system=True, # 确保 System Message 始终被保留
-    start_on="human",    # 确保从人类消息开始，避免悬挂的 AI 或 Tool 消息
+    token_counter=copilot_init_llm,
+    include_system=True,
+    start_on="human",
 )
 
 # --- 第二步：定义 LangGraph 状态机 ---
@@ -96,7 +90,7 @@ def call_diagnostic_model_bk(state: MaintenanceState):
 
     # 绑定工具
     tools = get_langchain_tools_from_fastmcp(mcp)
-    llm = llm_model.bind_tools(tools)
+    llm = copilot_init_llm.bind_tools(tools)
 
     chain = llm
     response = chain.invoke([system_prompt] + state["messages"])
@@ -104,47 +98,38 @@ def call_diagnostic_model_bk(state: MaintenanceState):
 
 
 def call_diagnostic_model(state: MaintenanceState):
-    # 1. 精简指令：不要直接透传整个 mcp.instructions
-    # 提取最核心的政策，过滤掉关于 HTML 结构、文件路径等模型不需要反复阅读的说明
-    core_rules = """
-    - Use evidence-based inference (ISO 13374).
-    - Do NOT make diagnostic claims based solely on statistical parameters.
-    - Confirm signal units before ISO 20816 evaluation.
-    - Bearing fault must be supported by frequency-domain evidence.
-    """
+    # 1. 消息清洗：防止工具返回的巨大数据撑爆 Body
+    processed_messages = []
+    for msg in state["messages"]:
+        if isinstance(msg, ToolMessage) and len(str(msg.content)) > 2000:
+            # 强制对过长的工具返回内容进行物理截断
+            content_str = str(msg.content)
+            truncated_content = content_str[:1000] + "... [数据过长已截断，请基于特征值推理]"
+            processed_messages.append(ToolMessage(
+                content=truncated_content,
+                tool_call_id=msg.tool_call_id
+            ))
+        else:
+            processed_messages.append(msg)
 
-    # system_prompt = SystemMessage(content=core_rules)
+    # 【修改点 1】极致缩减 System Prompt。不要在这里放 ISO 全文！
+    # 将复杂的 ISO 逻辑写在工具的 docstring 里，让模型通过工具调用来感知。
+    core_rules = SystemMessage(
+        content="Expert: ISO 13374. Action: Check RMS/Peaks. Rule: Truncated data? Use stats. Output: Concise summary."
+    )
 
-    # 1. 组合所有消息
-    # 注意：我们将精简后的 Instructions 放在最前面
-    system_prompt = SystemMessage(content=mcp.instructions[:2000])  # 截断原始超长指令
-    all_messages = [system_prompt] + state["messages"]
+    # 【修改点 2】将 trimmer 的 max_tokens 进一步下调
+    # 8000 总额 = System(500) + History(4000) + Output Buffer(3500)
+    # 建议将 trimmer 的 max_tokens 设为 3500-4000 之间
+    selected_history = trimmer.invoke(processed_messages)
 
-    # 2. 执行修剪
-    selected_messages = trimmer.invoke(all_messages)
+    # 3. 实例化并绑定工具
+    # 注意：tools 已经在外部定义好了
+    llm = copilot_init_llm.bind_tools(tools)
 
-    # 在发送给 Copilot 前，先修剪消息列表
-    # trimmed_msgs = trimmer.invoke(state["messages"])
+    # 发送：System + 被修剪的历史
+    response = llm.invoke([core_rules] + selected_history)
 
-    # 2. 限制历史消息长度 (这是解决 413 的关键)
-    # 只取最近的 5-10 轮对话，防止上下文累积导致的 Body 过大
-    # trimmed_messages = state["messages"][-10:]
-
-    # 自动保留最近的 5000 tokens 左右的消息，防止超出 8000 的 Body 限制
-    # messages = filter_messages(state["messages"], max_tokens=5000)
-
-    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-    llm = init_chat_model(
-        model="gpt-4o",
-        model_provider="openai",
-        api_key=GITHUB_TOKEN,
-        base_url="https://models.inference.ai.azure.com",
-        temperature=0,  # 诊断任务建议设为 0 以保证严谨性
-    ).bind_tools(tools)
-    # response = llm.invoke([system_prompt] + trimmed_messages)
-    # response = llm.invoke([system_prompt] + messages)
-    response = llm.invoke([system_prompt] + selected_messages)
-    # response = llm.invoke(trimmed_msgs)
     return {"messages": [response]}
 
 
@@ -158,8 +143,12 @@ tool_node = ToolNode(tools)
 def should_continue(state: MaintenanceState):
     """判断模型是想调用工具还是直接回复用户"""
     last_message = state["messages"][-1]
-    if last_message.tool_calls:
+
+    # 核心修复：先判断是否为 AIMessage，再检查 tool_calls
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tools"
+
+    # 如果是 HumanMessage 或不带工具调用的 AIMessage，则结束
     return END
 
 
