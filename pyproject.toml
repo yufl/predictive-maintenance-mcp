@@ -66,6 +66,7 @@ dependencies = [
     "mcp",
     "fastmcp>=3.2.0",
     "gradio>=6.11.0",
+    "tiktoken",
     "fastapi[standard]",
     "python-dotenv",
     "langgraph-cli[inmem]",

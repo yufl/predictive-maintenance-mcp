@@ -1,7 +1,7 @@
 from langchain.chat_models import init_chat_model
 from langchain_openai import ChatOpenAI
 
-from src.env_utils import GITHUB_TOKEN
+from src.env_utils import GITHUB_TOKEN, ZHIPU_SECRET_KEY
 
 copilot_class_llm = ChatOpenAI(
     model="gpt-4o",
@@ -22,5 +22,12 @@ copilot_init_llm = init_chat_model(
     base_url="https://models.inference.ai.azure.com",
 )
 
-# resp = copilot_init_llm.invoke("介绍一下自己。")
+zhipu_init_llm = init_chat_model(
+    model="glm-4.6",
+    model_provider="openai",
+    api_key=ZHIPU_SECRET_KEY,
+    base_url="https://open.bigmodel.cn/api/paas/v4",
+)
+
+# resp = zhipu_init_llm.invoke("介绍一下自己。")
 # print(resp)

@@ -26,6 +26,37 @@ except ImportError:
     # 适配不同的工作路径
     from src.server import mcp
 
+
+# --- 第一步：工具桥接逻辑 ---
+def safe_tool_wrapper(func):
+    """
+    更稳健的包装器：
+    1. 自动处理 ctx 参数
+    2. 物理截断返回内容 (解决 8000 Token 限制)
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        # 检查函数签名
+        sig = inspect.signature(func)
+        params = sig.parameters
+
+        # 如果函数需要 ctx 但 kwargs 里没有，自动补一个 None
+        if 'ctx' in params and 'ctx' not in kwargs and len(args) == 0:
+            kwargs['ctx'] = None
+
+        # 执行原始函数
+        result = func(*args, **kwargs)
+
+        # 结果截断：针对 8000 tokens 限制，强制将工具输出控制在 800 字符以内
+        # 这样即使分析 3 个设备，ToolMessage 总量也不会超标
+        str_result = str(result)
+        if len(str_result) > 800:
+            return str_result[:800] + "\n[数据过长已截断，请基于特征值推理]"
+        return result
+
+    return wrapper
+
 def wrap_and_trim_messages(left: list, right: list):
     """
     替换默认的 add_messages。
@@ -52,12 +83,55 @@ def get_langchain_tools_from_fastmcp(fastmcp_instance):
         # 使用 StructuredTool.from_function 自动处理参数架构
         # 它能完美识别无参数函数 (如 list_signals) 并防止 Argument 冲突
         lc_tools.append(StructuredTool.from_function(
-            func=tool_obj.fn,
+            func=safe_tool_wrapper(tool_obj.fn),
             name=tool_obj.name,
             description=tool_obj.description or tool_obj.fn.__doc__
         ))
     return lc_tools
 
+
+# --- 第一步：定义自定义计数逻辑 ---
+def custom_token_counter(messages: List[BaseMessage]) -> int:
+    """
+    计算消息列表的总 token 数。
+    由于 GLM-4.6 没有内置支持，我们使用 cl100k_base 编码进行估算。
+    """
+    # 获取编码器 (gpt-4 使用的编码器与大多数现代大模型相似)
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        # 如果无法获取 tiktoken，退而求其次使用字符长度估算 (1 token ≈ 1.5 - 2 汉字)
+        encoding = None
+
+    total_tokens = 0
+    for msg in messages:
+        # 基础开销：每条消息约 4 tokens (role, name 等字段)
+        total_tokens += 4
+
+        # 处理消息文本
+        content = msg.content
+        if isinstance(content, str):
+            if encoding:
+                total_tokens += len(encoding.encode(content))
+            else:
+                total_tokens += len(content) // 1.5  # 简单估算
+
+        # 如果是 AIMessage 且包含工具调用，也需要计入参数的 token
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                total_tokens += len(str(tc)) // 2  # 粗略估算工具调用参数
+
+    return int(total_tokens)
+
+# 2. 针对 8000 限制，将修剪器的阈值设为 2500 tokens
+# 给模型回复和工具定义留出足够空间
+local_trimmer = trim_messages(
+    max_tokens=2500,
+    strategy="last",
+    token_counter=custom_token_counter,
+    include_system=True,
+    start_on="human",
+)
 
 # --- 第二步：定义 LangGraph 状态机 ---
 
@@ -66,22 +140,81 @@ class MaintenanceState(TypedDict):
     messages: Annotated[List[BaseMessage], wrap_and_trim_messages]
 
 
-def call_diagnostic_model(state: MaintenanceState):
+# 1. 节点：LLM 决策节点
+def call_diagnostic_model_bk(state: MaintenanceState):
+    """
+    使用 Copilot 基础模型 (GPT-4o) 进行推理。
+    会自动注入 mcp_server.py 中定义的超长 instructions。
+    """
+    # 这里的关键是：必须注入你在 mcp 对象中定义的推理规则 (Instructions)
+    system_prompt = SystemMessage(content=mcp.instructions)
 
-    raw_history = state["messages"]
+    # 绑定工具
+    tools = get_langchain_tools_from_fastmcp(mcp)
+    llm = zhipu_init_llm.bind_tools(tools)
+
+    chain = llm
+    response = chain.invoke([system_prompt] + state["messages"])
+    return {"messages": [response]}
+
+
+# def call_diagnostic_model(state: MaintenanceState):
+#     # 1. 极其激进的清洗：将工具返回内容缩减到 800 字符以内
+#     processed_messages = []
+#     for msg in state["messages"]:
+#         if isinstance(msg, ToolMessage) and len(str(msg.content)) > 1000:
+#             content_str = str(msg.content)
+#             # 工业诊断只需要关键特征，不需要原始数组
+#             truncated_content = content_str[:800] + "...[Data Cut]"
+#             processed_messages.append(ToolMessage(
+#                 content=truncated_content,
+#                 tool_call_id=msg.tool_call_id
+#             ))
+#         else:
+#             processed_messages.append(msg)
+#
+#     # 彻底放弃 mcp.instructions，改用极简指令
+#     # core_rules = SystemMessage(content="Act as a vibration analyst. Be concise. Use only stats.")
+#
+#     # 1. 定义极其精简的系统指令
+#     core_rules = SystemMessage(content="""你是工业诊断专家。
+#         1. 仅基于统计特征(RMS/峰值)进行 ISO 20816 评价。
+#         2. 如果工具输出被截断，请利用现有数据给出结论。
+#         3. 报告需简洁，严禁输出原始波形。""")
+#
+#     selected_history = local_trimmer.invoke(processed_messages)
+#
+#     # 3. 绑定工具并调用
+#     # llm = zhipu_init_llm.bind_tools(tools[:5])
+#     llm = zhipu_init_llm.bind_tools(tools)
+#     response = llm.invoke([core_rules] + selected_history)
+#
+#     return {"messages": [response]}
+
+
+def call_diagnostic_model(state: MaintenanceState):
+    # 1. 极其激进的清洗：将工具返回内容缩减到 800 字符以内
+    processed_messages = []
+    for msg in state["messages"]:
+        if isinstance(msg, ToolMessage) and len(str(msg.content)) > 1000:
+            content_str = str(msg.content)
+            # 工业诊断只需要关键特征，不需要原始数组
+            truncated_content = content_str[:800] + "...[Data Cut]"
+            processed_messages.append(ToolMessage(
+                content=truncated_content,
+                tool_call_id=msg.tool_call_id
+            ))
+        else:
+            processed_messages.append(msg)
+
+    raw_history = local_trimmer.invoke(processed_messages)
 
     # 【新增修复逻辑】
     clean_history = []
     for i, msg in enumerate(raw_history):
         # 1. 跳过内容为空的消息
-        if isinstance(msg, dict) and not msg['content']:
+        if not msg.content and (not isinstance(msg, AIMessage) or not msg.tool_calls):
             continue
-        if not isinstance(msg, AIMessage):
-            continue
-        print(type(msg))
-        print(msg)
-        # if not msg['content'] and (not isinstance(msg, AIMessage) or not msg['tool_calls']):
-        #     continue
 
         # 2. 确保 ToolMessage 之前一定有一个带 tool_calls 的 AIMessage
         if isinstance(msg, ToolMessage):
@@ -137,7 +270,7 @@ def should_continue(state: MaintenanceState):
 workflow = StateGraph(MaintenanceState)
 
 # 添加节点
-workflow.add_node("agent", call_diagnostic_model)
+workflow.add_node("agent", call_diagnostic_model_bk)
 workflow.add_node("tools", tool_node)
 
 # 设置逻辑连线
